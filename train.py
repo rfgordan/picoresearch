@@ -1,9 +1,10 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: uv run train.py [--chat]
 """
 
+import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -16,11 +17,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+if cap >= (9, 0):
+    # Hopper (H100) and newer: use Flash Attention 3
+    from kernels import get_kernel
+    fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface
+    USE_FA3 = True
+else:
+    # Ada Lovelace (4090) and older: fall back to PyTorch SDPA
+    fa3 = None
+    USE_FA3 = False
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -89,8 +95,19 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if USE_FA3:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = y.contiguous().view(B, T, -1)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            if self.n_kv_head < self.n_head:
+                repeat = self.n_head // self.n_kv_head
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -431,7 +448,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context (SDPA requires L)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -447,11 +464,18 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64   # per-device batch size (fits with 4096 vocab on 24GB 4090)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--chat", action="store_true", help="Drop into interactive sampling after training")
+parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (0=greedy)")
+parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling (0=disabled)")
+parser.add_argument("--max-tokens", type=int, default=200, help="Max new tokens per generation")
+args = parser.parse_args()
 
 t_start = time.time()
 torch.manual_seed(42)
@@ -627,3 +651,66 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+
+if not args.chat:
+    exit(0)
+
+# ---------------------------------------------------------------------------
+# Interactive sampling CLI (--chat)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate(tokens, max_new_tokens, temperature, top_k):
+    for _ in range(max_new_tokens):
+        ctx = tokens[-MAX_SEQ_LEN:]
+        x = torch.tensor([ctx], dtype=torch.long, device=device)
+        with autocast_ctx:
+            logits = model(x)
+        logits = logits[0, -1].float()
+        if temperature > 0:
+            logits /= temperature
+            if top_k > 0:
+                logits[logits < torch.topk(logits, top_k).values[-1]] = -float("inf")
+            next_tok = torch.multinomial(torch.softmax(logits, -1), 1).item()
+        else:
+            next_tok = logits.argmax().item()
+        tokens.append(next_tok)
+        yield next_tok
+
+model.eval()
+bos = tokenizer.get_bos_token_id()
+tokens = [bos]
+
+print()
+print("Sampling CLI  (base LM — completes text, not a chat assistant)")
+print("Commands: 'clear' to reset context, 'quit' to exit")
+print("-" * 60)
+
+while True:
+    label = "Prompt" if len(tokens) == 1 else "Continue (or new prompt to reset)"
+    try:
+        user_input = input(f"\n{label}> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nGoodbye!")
+        break
+
+    if user_input.lower() in ("quit", "exit"):
+        print("Goodbye!")
+        break
+
+    if user_input.lower() == "clear":
+        tokens = [bos]
+        print("Context cleared.")
+        continue
+
+    if user_input:
+        tokens = [bos] + tokenizer.encode(user_input)
+    elif len(tokens) == 1:
+        print("(type a prompt first)")
+        continue
+
+    print()
+    for tok in generate(tokens, args.max_tokens, args.temperature, args.top_k):
+        print(tokenizer.decode([tok]), end="", flush=True)
+    print()
